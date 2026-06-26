@@ -1,0 +1,7 @@
+# local scratch / generated lists — never commit repo lists or logs
+repos*.txt
+*.log
+
+# editor / OS noise
+.DS_Store
+*.swp
