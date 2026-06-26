@@ -156,10 +156,19 @@ clone_specs() {
       [ "${NOFETCH:-0}" = 1 ] || git -C "$dir" fetch --quiet --all --prune 2>/dev/null
     else
       echo "  cloning $url" >&2
-      if git clone --quiet "$url" "$dir" 2>/dev/null; then
+      # Retry with backoff: a big sweep clones 200+ repos back-to-back, which trips
+      # GitHub's SSH connection rate limit and fails transiently. Retrying the
+      # failures (not the whole run) recovers them without re-cloning what worked.
+      local attempt err ok=0
+      for attempt in 1 2 3; do
+        err="$(git clone --quiet "$url" "$dir" 2>&1)" && { ok=1; break; }
+        rm -rf "$dir"                                   # drop any partial clone
+        [ "$attempt" -lt 3 ] && sleep "$((attempt * attempt * 2))"   # 2s, 8s
+      done
+      if [ "$ok" = 1 ]; then
         cloned=$((cloned+1))
       else
-        echo "  $(c_red 'clone failed'): $url (check access / SSH key)" >&2
+        echo "  $(c_red 'clone failed'): $url — ${err##*$'\n'}" >&2
         failed=$((failed+1))
       fi
     fi
