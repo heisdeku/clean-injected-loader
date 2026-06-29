@@ -33,13 +33,19 @@ auto-removed).
 
 ## How it fixes things
 
-Per infected branch, **real work is always preserved** — only the tampered setup file
+Per infected branch, **real work is always preserved** — only the tampered file
 and the `.gitignore` `config.bat` line ever change:
 
-1. restore the setup file to its **last clean version on that branch**, else
+1. restore the infected file to its **last clean version on that branch**, else
 2. restore it from the **clean default branch**, else
-3. **strip the injected loader in place** (when the file was infected from its first
-   commit and no clean version exists anywhere).
+3. when the file was infected from its very first commit and no clean version
+   exists anywhere:
+   - **obfuscated loader** (`_$_`) → strip the loader prologue/payload in place;
+   - **eval()/C2 backdoor** → excise **only** the self-executing `(async () => {
+     … atob(process.env…) … eval(…) … })();` IIFE (brace-matched, so the nested
+     node-fetch import and the eval go with it). The file is **kept** — never
+     deleted, even if the strip leaves it empty — and every other line (real
+     config, a pre-existing `dotenv/config` import, etc.) is left untouched.
 
 `clean` adds one commit on top (no history rewrite). `purge` rewrites history so the
 malware was never in the commits. All work happens in a throwaway worktree/clone, so
