@@ -38,6 +38,8 @@ set -uo pipefail
 MARKER='_\$_'                 # git-grep (regex) form of the obfuscated-loader marker
 MARKER_PLAIN='_$_'            # literal form for fixed-string grep on files
 GITIGNORE_BAD='config.bat'    # dropped-file name hidden in .gitignore
+# Anchored: only a line that IS `config.bat` (not e.g. a legit `config.batch/`).
+GITIGNORE_BAD_RE='^[[:space:]]*config\.bat[[:space:]]*$'
 WORKSPACE="${TMPDIR:-/tmp}/injected-loader-fix"
 FIXED_MAP=()                  # filled per repo: "tmpbranch:originalbranch"
 
@@ -57,7 +59,21 @@ C2_DOMAIN='auth-confirm-eight.vercel.app'
 # Signature of the eval()/C2 backdoor specifically (everything except the loader
 # marker). Used to strip/remove it when there is no clean ancestor to restore.
 EVAL_C2_RE='auth-confirm-eight\.vercel\.app|AUTH_API_KEY|Auth Error!|atob[[:space:]]*\([[:space:]]*process\.env'
-IOC_RE="_\\\$_|$EVAL_C2_RE"
+# INC-2026-10-31 variant: the same loader without the `_$_` marker, hidden after
+# ~31k spaces on ONE line of a config file (astro/postcss/… .config.mjs) and of a
+# dropped `init` module, plus the payload itself disguised as a Font Awesome file
+# that a VS Code folderOpen auto-task runs when the folder is opened.
+#   (global,require))            the loader IIFE's closing call — present in every
+#                                payload file (config, init, .orc)
+#   node init &&                 package.json dev/build scripts made to run `init`
+#   <name>.orc                   the disguised payload (`fa-brand-400.orc`), and the
+#                                .vscode/tasks.json command that launches it
+#   task.allowAutomaticTasks     the .vscode/settings.json switch that lets that
+#                                task run without asking (dual-use: reviewed, only
+#                                removed next to a .orc-launching tasks.json)
+LOADER2_RE='\(global,[[:space:]]*require\)\)'
+DROPPER_RE='node init && |[A-Za-z0-9_-]+\.orc([^A-Za-z0-9]|$)|task\.allowAutomaticTasks'
+IOC_RE="_\\\$_|$LOADER2_RE|$DROPPER_RE|$EVAL_C2_RE"
 
 # Commands that EXECUTE these backdoors — never run them on an unscanned checkout:
 #   npm/yarn install, build/dev, AND (from the incident) drizzle-kit migrate,
@@ -268,6 +284,8 @@ infected_files() {
 ioc_labels() {
   local ref="$1" out=""
   git grep -qIE '_\$_' "$ref" 2>/dev/null && out="$out loader"
+  git grep -qIE "$LOADER2_RE" "$ref" 2>/dev/null && out="$out loader-v2"
+  git grep -qIE "$DROPPER_RE" "$ref" 2>/dev/null && out="$out dropper"
   git grep -qI "$C2_DOMAIN" "$ref" 2>/dev/null && out="$out C2-url"
   git grep -qI 'AUTH_API_KEY' "$ref" 2>/dev/null && out="$out AUTH_API_KEY"
   { git grep -qI 'Auth Error!' "$ref" 2>/dev/null \
@@ -293,7 +311,7 @@ worktree_hits() {
 
 # Does this ref's .gitignore hide config.bat?
 gitignore_tampered() {
-  git grep -q "$GITIGNORE_BAD" "$1" -- .gitignore 2>/dev/null
+  git grep -qE "$GITIGNORE_BAD_RE" "$1" -- .gitignore 2>/dev/null
 }
 
 # Template env files that are MEANT to be committed (no real secrets).
@@ -338,9 +356,9 @@ last_clean_commit() {
 # createRequire loader prologue, (4) tidy leading/trailing blank lines.
 strip_marker_file() {
   local f="$1"
-  local loader_re='^import \{ createRequire \} from .module.;[[:space:]]*$|^const require = createRequire\(import\.meta\.url\);[[:space:]]*$'
+  local loader_re='^import \{ createRequire \} from .module.;[[:space:]]*$|^(const|var) require = createRequire\(import\.meta\.url\);[[:space:]]*$|^var module = \{ exports: \{\} \};[[:space:]]*$'
   sed -E 's/[[:blank:]]{8,}[^[:blank:]].*$//' "$f" > "$f.__s1"
-  grep -vF -- "$MARKER_PLAIN" "$f.__s1" > "$f.__s2"
+  grep -vF -- "$MARKER_PLAIN" "$f.__s1" | grep -vE "$LOADER2_RE" > "$f.__s2"
   grep -vE "$loader_re" "$f.__s2" > "$f.__s3"
   awk 'BEGIN{n=0;st=0}
        { if(!st && $0 ~ /^[[:space:]]*$/) next; st=1; a[++n]=$0 }
@@ -374,6 +392,53 @@ strip_eval_backdoor() {
        END{ while(n>0 && a[n] ~ /^[[:space:]]*$/) n--; for(i=1;i<=n;i++) print a[i] }' \
        "$f.__e1" > "$f"
   rm -f "$f.__e1"
+}
+
+# INC-2026-10-31 dropper files are pure malware with nothing to restore — delete:
+#   init                 dropped CommonJS stub carrying the padded loader, run by
+#                        the tampered package.json scripts (`node init && …`)
+#   *.orc                the obfuscated payload disguised as a Font Awesome file
+#   .vscode/tasks.json   only when it launches a .orc (the folderOpen auto-task)
+#   .vscode/settings.json only when it enables automatic tasks AND sits next to
+#                        such a tasks.json (the still-present one, so order of
+#                        processing does not matter)
+is_dropper_file() {
+  local f="$1" d; d="$(dirname "$f")"
+  case "$(basename "$f")" in
+    init)          grep -qE "$LOADER2_RE" "$f" 2>/dev/null ;;
+    *.orc)         return 0 ;;
+    tasks.json)    [ "$(basename "$d")" = .vscode ] && grep -q '\.orc' "$f" 2>/dev/null ;;
+    settings.json) [ "$(basename "$d")" = .vscode ] && grep -q 'task\.allowAutomaticTasks' "$f" 2>/dev/null \
+                     && grep -q '\.orc' "$d/tasks.json" 2>/dev/null ;;
+    *)             return 1 ;;
+  esac
+}
+
+# Newest commit reachable from $ref whose .gitignore is untampered: no config.bat
+# line and the literal .env still ignored. Restoring it beats patching the tip.
+last_clean_gitignore() {
+  local ref="$1" c
+  for c in $(git rev-list "$ref" -- .gitignore 2>/dev/null); do
+    git cat-file -e "$c:.gitignore" 2>/dev/null || continue
+    git show "$c:.gitignore" 2>/dev/null | grep -qE "$GITIGNORE_BAD_RE" && continue
+    env_ref_ignored "$c" && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+# Delete a dropper. A .orc also takes its directory with it when every sibling
+# is part of the disguise (fa-*.{eot,svg,ttf,woff,woff2} + a README.md).
+remove_dropper() {
+  local f="$1" d
+  git rm -q --cached -- "$f" 2>/dev/null; rm -f "$f"
+  printf '      %-26s dropper removed\n' "$f"
+  case "$f" in *.orc)
+    d="$(dirname "$f")"
+    if [ -d "$d" ] && ! ls -A "$d" | grep -qvE '^(fa-[a-z]+-[0-9]+\.(eot|svg|ttf|woff|woff2)|README\.md)$'; then
+      git rm -rq --cached -- "$d" 2>/dev/null; rm -rf "$d"
+      printf '      %-26s decoy font directory removed\n' "$d/"
+    fi ;;
+  esac
 }
 
 # Repo in CWD has anything worth cleaning? (env issues count only in --env mode)
@@ -506,8 +571,13 @@ clean_branch() {
   while IFS= read -r f; do
     [ -z "$f" ] && continue
     if [ "$f" = ".gitignore" ]; then
-      grep -vF -- "$GITIGNORE_BAD" .gitignore > .gitignore.__t && mv .gitignore.__t .gitignore
-      printf '      %-26s stripped %s line\n' ".gitignore" "$GITIGNORE_BAD"
+      if src="$(last_clean_gitignore "$rb")"; then
+        git show "$src:.gitignore" > .gitignore
+        printf '      %-26s restored from %s (last untampered on branch)\n' ".gitignore" "${src:0:8}"
+      else
+        grep -vE -- "$GITIGNORE_BAD_RE" .gitignore > .gitignore.__t && mv .gitignore.__t .gitignore
+        printf '      %-26s stripped %s line\n' ".gitignore" "$GITIGNORE_BAD"
+      fi
     elif src="$(last_clean_commit "$rb" "$f")"; then
       git show "$src:$f" > "$f"
       printf '      %-26s restored from %s (last clean on branch)\n' "$f" "${src:0:8}"
@@ -516,7 +586,12 @@ clean_branch() {
          && ! git show "$defref:$f" 2>/dev/null | grep -qE "$IOC_RE"; then
       git show "$defref:$f" > "$f"
       printf '      %-26s restored from clean %s\n' "$f" "$defref"
-    elif grep -qF -- "$MARKER_PLAIN" "$f" 2>/dev/null; then
+    elif is_dropper_file "$f"; then
+      remove_dropper "$f"
+    elif [ "$(basename "$f")" = package.json ] && grep -q 'node init && ' "$f"; then
+      sed 's/node init && //g' "$f" > "$f.__t" && mv "$f.__t" "$f"
+      printf '      %-26s removed `node init &&` from scripts\n' "$f"
+    elif grep -qF -- "$MARKER_PLAIN" "$f" 2>/dev/null || grep -qE "$LOADER2_RE" "$f" 2>/dev/null; then
       # only the obfuscated loader can be safely stripped in place
       strip_marker_file "$f"
       printf '      %-26s loader stripped in place; result below:\n' "$f"
@@ -566,7 +641,7 @@ clean_branch() {
   fi
 
   if git grep -qIE "$IOC_RE" HEAD 2>/dev/null \
-     || git grep -q "$GITIGNORE_BAD" HEAD -- .gitignore 2>/dev/null; then
+     || git grep -qE "$GITIGNORE_BAD_RE" HEAD -- .gitignore 2>/dev/null; then
     printf '      %s IOC still present after clean — left for manual review!\n' "$(c_red 'FAIL')"; return 1
   fi
   printf '      %s verified clean\n' "$(c_grn '✓')"
@@ -708,13 +783,35 @@ write_cleaner() {
 #!/usr/bin/env bash
 set -u
 MARKER='_$_'
-loader_re='^import \{ createRequire \} from .module.;[[:space:]]*$|^const require = createRequire\(import\.meta\.url\);[[:space:]]*$'
+loader2_re='\(global,[[:space:]]*require\)\)'
+loader_re='^import \{ createRequire \} from .module.;[[:space:]]*$|^(const|var) require = createRequire\(import\.meta\.url\);[[:space:]]*$|^var module = \{ exports: \{\} \};[[:space:]]*$'
 
-# 1) strip the injected loader from every file that carries the marker
-grep -rIlF -- "$MARKER" . 2>/dev/null | while IFS= read -r f; do
+# 0) delete the INC-2026-10-31 droppers outright: `init` stubs carrying the
+#    loader, every *.orc payload (plus its decoy fa-* font directory), and a
+#    .vscode/tasks.json that launches a .orc. Then un-prefix `node init && `.
+find . -path ./.git -prune -o -type f -name init -print 2>/dev/null | while IFS= read -r f; do
+  grep -qE "$loader2_re" "$f" && rm -f "$f"
+done
+find . -path ./.git -prune -o -type f -name '*.orc' -print 2>/dev/null | while IFS= read -r f; do
+  d="$(dirname "$f")"; rm -f "$f"
+  ls -A "$d" | grep -qvE '^(fa-[a-z]+-[0-9]+\.(eot|svg|ttf|woff|woff2)|README\.md)$' || rm -rf "$d"
+done
+find . -path ./.git -prune -o -type f -path '*/.vscode/tasks.json' -print 2>/dev/null | while IFS= read -r f; do
+  grep -q '\.orc' "$f" || continue
+  s="$(dirname "$f")/settings.json"
+  [ -f "$s" ] && grep -q 'task\.allowAutomaticTasks' "$s" && rm -f "$s"
+  rm -f "$f"
+done
+find . -path ./.git -prune -o -type f -name package.json -print 2>/dev/null | while IFS= read -r f; do
+  grep -q 'node init && ' "$f" || continue
+  sed 's/node init && //g' "$f" > "$f.__t" && mv "$f.__t" "$f"
+done
+
+# 1) strip the injected loader from every file that carries a marker
+grep -rIlE -- "$MARKER|$loader2_re" . 2>/dev/null | while IFS= read -r f; do
   [ -f "$f" ] || continue
   sed -E 's/[[:blank:]]{8,}[^[:blank:]].*$//' "$f" > "$f.__s1"
-  grep -vF -- "$MARKER" "$f.__s1" > "$f.__s2"
+  grep -vF -- "$MARKER" "$f.__s1" | grep -vE "$loader2_re" > "$f.__s2"
   grep -vE "$loader_re" "$f.__s2" > "$f.__s3"
   awk 'BEGIN{n=0;st=0}{if(!st&&$0~/^[[:space:]]*$/)next;st=1;a[++n]=$0}
        END{while(n>0&&a[n]~/^[[:space:]]*$/)n--;for(i=1;i<=n;i++)print a[i]}' "$f.__s3" > "$f"
@@ -741,7 +838,7 @@ done
 # 2) remove config.bat from every .gitignore, and restore .env ignore rules
 #    (matches `clean`: add a real .env rule wherever one isn't already present)
 find . -name .gitignore -type f 2>/dev/null | while IFS= read -r gi; do
-  grep -vF -- 'config.bat' "$gi" > "$gi.__t" && mv "$gi.__t" "$gi"
+  grep -vE -- '^[[:space:]]*config\.bat[[:space:]]*$' "$gi" > "$gi.__t" && mv "$gi.__t" "$gi"
   if ! grep -qE '^[[:space:]]*(\.env\*?|\.env/|\*\.env)[[:space:]]*$' "$gi"; then
     printf '\n# local env files (restored by security cleanup)\n.env\n.env.*\n!.env.example\n!.env.sample\n' >> "$gi"
   fi

@@ -15,7 +15,7 @@ malicious code.
 
 ## What it looks for
 
-Two malware families, both surfaced as **IOCs** (indicators of compromise):
+Three malware families, all surfaced as **IOCs** (indicators of compromise):
 
 1. **Obfuscated createRequire loader** — scrambled code hidden in a setup file
    (`postcss.config.*`, `tailwind.config.*`, `next.config.*`, `commitlint.config.*`,
@@ -26,6 +26,18 @@ Two malware families, both surfaced as **IOCs** (indicators of compromise):
    a command-and-control URL, and `eval()`s the response. IOCs:
    `auth-confirm-eight.vercel.app`, `AUTH_API_KEY`, `"Auth Error!"`, an injected
    `node-fetch`, and a committed `.env`.
+3. **Padded loader + editor auto-task dropper** (INC-2026-10-31) — the same loader
+   without the `_$_` marker, hidden after ~31k spaces on a single line of a config
+   file (`astro.config.mjs`, `postcss.config.mjs`, …) and of a dropped `init` module
+   that `package.json` is made to run (`"build": "node init && …"`). The payload itself
+   is disguised as a Font Awesome file (`fa-brand-400.orc`, in a fake `public/fonts/`
+   dir full of real `fa-*.woff` decoys) and launched by a `.vscode/tasks.json`
+   `folderOpen` task, enabled by `task.allowAutomaticTasks` in `.vscode/settings.json`
+   — so merely **opening the repo in VS Code or Cursor runs it**. IOCs:
+   `(global,require))`, `node init && `, any `*.orc`, `task.allowAutomaticTasks`,
+   plus the usual `.gitignore` tampering (`config.bat` added, `.env` un-ignored).
+   Pushed as a **force-push that replaces each branch tip** with an unsigned copy
+   of the same commit, so an unverified tip where you sign your commits is the tell.
 
 It also flags **`.env` hygiene** problems (a `.env` that isn't ignored, real secrets
 committed to history) and surfaces any `eval(` for **manual review** (dual-use — not
@@ -45,7 +57,19 @@ and the `.gitignore` `config.bat` line ever change:
      … atob(process.env…) … eval(…) … })();` IIFE (brace-matched, so the nested
      node-fetch import and the eval go with it). The file is **kept** — never
      deleted, even if the strip leaves it empty — and every other line (real
-     config, a pre-existing `dotenv/config` import, etc.) is left untouched.
+     config, a pre-existing `dotenv/config` import, etc.) is left untouched;
+   - **padded loader** (`(global,require))`) → same in-place strip as the `_$_` loader
+     (the `var require = createRequire(…)` / `var module = …` prologue goes too);
+   - **droppers** → deleted outright, since they are pure malware with nothing to
+     restore: the `init` stub, every `*.orc` (and its decoy `fa-*` font directory when
+     nothing else lives there), a `.vscode/tasks.json` that launches a `.orc`, and the
+     `.vscode/settings.json` beside it that enables automatic tasks; `package.json`
+     gets its `node init && ` prefix removed.
+
+`.gitignore` is restored to its last untampered version on the branch (no `config.bat`
+line, `.env` still ignored); only when none exists is the `config.bat` line stripped and
+the `.env` rules re-added. The `config.bat` match is anchored to a whole line, so a
+legitimate `config.batch/` entry is never touched.
 
 `clean` adds one commit on top (no history rewrite). `purge` rewrites history so the
 malware was never in the commits. All work happens in a throwaway worktree/clone, so

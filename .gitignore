@@ -5,3 +5,4 @@ repos*.txt
 # editor / OS noise
 .DS_Store
 *.swp
+incidents/
