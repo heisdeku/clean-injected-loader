@@ -36,6 +36,9 @@ Three malware families, all surfaced as **IOCs** (indicators of compromise):
    — so merely **opening the repo in VS Code or Cursor runs it**. IOCs:
    `(global,require))`, `node init && `, any `*.orc`, `task.allowAutomaticTasks`,
    plus the usual `.gitignore` tampering (`config.bat` added, `.env` un-ignored).
+   Some repos also got a committed one-line `.env` holding `AUTH_API_KEY` — the
+   attacker's own base64 pointer to the second stage on `files.catbox.moe` — and the
+   family-2 `AUTH_API_KEY` backdoor in a config file.
    Pushed as a **force-push that replaces each branch tip** with an unsigned copy
    of the same commit, so an unverified tip where you sign your commits is the tell.
 

